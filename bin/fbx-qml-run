@@ -1,0 +1,268 @@
+#!/usr/bin/env python2.7
+# -*- python -*-
+
+import BaseHTTPServer as httpserver
+import SimpleHTTPServer as simplehttpserver
+import SocketServer as socketserver
+import threading
+import os, os.path, posixpath
+
+def mdns_find(service):
+    from zeroconf import ServiceBrowser, Zeroconf
+    import time
+
+    class Enumerator(Zeroconf):
+        class ServiceListener:
+            def __init__(self, owner):
+                self.__owner = owner
+
+            def addService(self, zeroconf, type, name):
+                import socket
+                info = zeroconf.getServiceInfo(type, name)
+                if not info:
+                    return
+
+                self.__owner.found(socket.inet_ntoa(info.getAddress()))
+
+        def __init__(self, stype):
+            Zeroconf.__init__(self)
+            self.__listener = self.__class__.ServiceListener(self)
+            self.__browser = ServiceBrowser(self, stype, self.__listener)
+            self.__found = []
+
+        def found(self, addr):
+            self.__found.append(addr)
+
+        def any(self):
+            if self.__found:
+                return self.__found[0]
+
+    print "Finding hosts for", service
+    e = Enumerator(service)
+    for i in range(30):
+        r = e.any()
+        if r:
+            print "Found", r
+            return r
+        time.sleep(.1)
+
+class ThreadedHTTPServer(socketserver.ThreadingMixIn, httpserver.HTTPServer):
+    """Handle requests in a separate thread."""
+
+class FileServer(simplehttpserver.SimpleHTTPRequestHandler):
+    def end_headers(self):
+        self.send_no_cache()
+        simplehttpserver.SimpleHTTPRequestHandler.end_headers(self)
+
+    def send_no_cache(self):
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+
+    def translate_path(self, path):
+        import urllib
+
+        path = path.split('?',1)[0]
+        path = path.split('#',1)[0]
+        trailing_slash = True if path.rstrip().endswith('/') else False
+        path = posixpath.normpath(urllib.unquote(path))
+        words = path.split('/')
+        words = filter(None, words)
+        path = self.server.base_directory
+
+        for word in words:
+            drive, word = os.path.splitdrive(word)
+            head, word = os.path.split(word)
+            if word in (os.curdir, os.pardir): continue
+            path = os.path.join(path, word)
+
+        if trailing_slash:
+            path += '/'
+
+        return path
+
+class AppServer(threading.Thread):
+    def __init__(self, host, port, directory):
+        self.host = host
+        self.port = int(port)
+        self.server = ThreadedHTTPServer(
+            (host, port),
+            FileServer)
+        self.server.base_directory = directory
+        threading.Thread.__init__(self)
+
+    def run(self):
+        self.server.serve_forever()
+
+    def stop(self):
+        self.server.shutdown()
+
+    def file_url(self, name):
+        return "http://%s:%d/%s" % (self.host, self.port, name)
+
+class SocketDumperThread(threading.Thread):
+    def __init__(self, addr, output):
+        threading.Thread.__init__(self)
+        import socket
+        self.socket = socket.create_connection(addr)
+        self.socket.setblocking(0)
+        self.output = output
+        self.end = False
+        self.start()
+
+    def read(self, size):
+        return self.socket.recv(size)
+
+    def fileno(self):
+        return self.socket.fileno()
+
+    def run(self):
+        import shutil, select
+
+        while not self.end:
+            r, w, i = select.select([self.socket], [], [], .5)
+            if self.socket in r:
+                try:
+                    shutil.copyfileobj(self, self.output, 1024)
+                except:
+                    pass
+
+    def stop(self):
+        self.end = True
+        self.socket.close()
+        self.join()
+
+class JSONRpcError(Exception):
+    def __init__(self, code, message):
+        self.code = code
+        self.message = message
+    def __str__(self):
+        return "Json RPC Error %s: '%s'" % (self.code, self.message)
+
+class HttpError(Exception):
+    def __init__(self, code):
+        self.code = code
+    def __str__(self):
+        return "HTTP %d" % (self.code)
+
+def jsonrpc(endpoint, method, args, id = None):
+    import random
+    import json
+    import urllib2
+
+    data = dict(
+        method = method,
+        params = args,
+        id = str(id or random.randint(0, 10000)),
+        jsonrpc = "2.0",
+        )
+
+    body = json.dumps(data)
+
+    req = urllib2.Request(endpoint, body, {
+            "Content-type": "application/json",
+            "Accept": "application/json",
+            })
+    rsp = urllib2.urlopen(req)
+
+    code = rsp.getcode()
+    if code != 200:
+        raise HttpError(code)
+    body = json.load(rsp)
+
+    print body
+
+    if "result" in body:
+        return body["result"]
+
+    if "error" in body:
+        e = body["error"]
+        raise JSONRpcError(e.get("code", -1), e.get("message", ""))
+    raise JSONRpcError(-1, "No result nor error")
+
+def local_addr_to(addr, port):
+    import socket
+    s = socket.create_connection((addr, port))
+    local = s.getsockname()
+    s.close()
+    return local[0]
+
+class QmlRunner:
+    def __init__(self, host, http_port, app_dir, entry_point):
+        import sys
+
+        local_addr = local_addr_to(host, 80)
+
+        self.server = AppServer(local_addr, http_port, app_dir)
+        self.server.start()
+
+        try:
+            ret = jsonrpc("http://%s/pub/devel" % host, "debug_qml_app", dict(
+                    manifest_url = self.server.file_url("manifest.json"),
+                    entry_point = entry_point,
+                    wait = False,
+                    ))
+        except:
+            self.server.stop()
+            raise
+
+        self.stdout = SocketDumperThread((host, ret["stdout_port"]), sys.stdout)
+        self.stderr = SocketDumperThread((host, ret["stderr_port"]), sys.stderr)
+
+    def stop(self):
+        print 'Closing stdout'
+        self.stdout.stop()
+        print 'Closing stderr'
+        self.stderr.stop()
+        print 'Stopping HTTP server'
+        self.server.stop()
+
+def main(args):
+    manifest_filename = os.path.abspath(args.manifest)
+    app_directory = os.path.dirname(manifest_filename)
+
+    host = args.target
+    if not host:
+        host = mdns_find("_fbx-devel._tcp.local.")
+        if not host:
+            print "Unable to find box through mDNS"
+
+    runner = QmlRunner(host, args.http_port, app_directory, args.entry_point)
+
+    while True:
+        try:
+            raw_input()
+        except (KeyboardInterrupt, EOFError):
+            break
+
+    print "Exitting"
+
+    runner.stop()
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description = 'Remotely run a QML application on Freebox')
+    parser.add_argument(
+        '-p', metavar = 'PORT', type = int,
+        default = 8234, dest = 'http_port',
+        help = 'Local TCP port to bind HTTP server on')
+
+    parser.add_argument(
+        '-e', metavar = 'ENTRYPOINT', type = str,
+        default = "main", dest = 'entry_point',
+        help = 'Entry point in package')
+
+    parser.add_argument(
+        '-t', metavar = 'TARGET_ADDR', type = str,
+        default = "", dest = "target",
+        help = 'Freebox IP (mDNS-detected if unspecified)')
+
+    parser.add_argument(
+        'manifest', type = str,
+        help = 'Package manifest file')
+
+    args = parser.parse_args()
+
+    main(args)
